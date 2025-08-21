@@ -1,0 +1,136 @@
+# rag_print_all.py
+import os
+import json
+import numpy as np
+import faiss
+import subprocess
+
+# ---- 0) CONFIG ----
+DOCS = [
+    "The capital of France is Paris.",
+    "The Eiffel Tower is a wrought-iron lattice tower in Paris, France.",
+    "The Great Wall of China stretches across northern China.",
+    "The Taj Mahal is a mausoleum located in Agra, India."
+]
+QUERY = "Where is the Eiffel Tower located?"
+OLLAMA_MODEL = "mistral"  # e.g., "mistral", "llama3", "phi3"
+USE_GPU_FOR_EMBEDDINGS = True  # will fallback to CPU if CUDA is unavailable
+
+# ---- 1) EMBEDDINGS ----
+from sentence_transformers import SentenceTransformer
+import torch
+
+device = "cuda" if (USE_GPU_FOR_EMBEDDINGS and torch.cuda.is_available()) else "cpu"
+embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device=device)
+
+print("=== EMBEDDING SETUP ===")
+print(f"Device: {device}")
+print(f"Model: {embedder}")
+
+# embed documents
+doc_embeddings = embedder.encode(DOCS, convert_to_tensor=False, show_progress_bar=False)
+doc_embeddings = np.asarray(doc_embeddings, dtype=np.float32)  # shape: (N, D)
+
+print("\n=== RAW DOCUMENTS ===")
+for i, d in enumerate(DOCS):
+    print(f"[DOC {i}] {d}")
+
+print("\n=== DOCUMENT EMBEDDINGS (full vectors) ===")
+print(f"Embeddings shape: {doc_embeddings.shape}")
+for i, vec in enumerate(doc_embeddings):
+    print(f"[DOC {i}] embedding ({len(vec)} dims):")
+    print(vec)  # full vector printed
+
+# embed query
+query_embedding = embedder.encode([QUERY], convert_to_tensor=False, show_progress_bar=False)
+query_embedding = np.asarray(query_embedding, dtype=np.float32)[0]
+
+print("\n=== QUERY ===")
+print(QUERY)
+print("\n=== QUERY EMBEDDING (full vector) ===")
+print(f"Len: {len(query_embedding)}")
+print(query_embedding)
+
+# ---- 2) BUILD FAISS (cosine via normalized vectors + inner product) ----
+# Normalize to use inner product as cosine similarity
+def l2_normalize(x: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+    return x / norms
+
+doc_embeddings_norm = l2_normalize(doc_embeddings.copy())
+query_embedding_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-12)
+
+dim = doc_embeddings_norm.shape[1]
+index = faiss.IndexFlatIP(dim)  # Inner Product
+index.add(doc_embeddings_norm)
+
+print("\n=== FAISS INDEX ===")
+print(f"Index type: {type(index).__name__}")
+print(f"Dim: {dim}")
+print(f"ntotal (number of vectors): {index.ntotal}")
+
+# ---- 3) SEARCH ----
+k = min(3, len(DOCS))
+scores, idxs = index.search(query_embedding_norm.reshape(1, -1).astype(np.float32), k)
+scores = scores[0]   # cosine similarity because of normalization
+idxs = idxs[0]
+
+print("\n=== SEARCH RESULTS (cosine similarity) ===")
+for rank, (i, s) in enumerate(zip(idxs, scores), start=1):
+    print(f"#{rank}: DOC {i} | score={s:.6f} | text={DOCS[i]}")
+
+# ---- 4) BUILD PROMPT WITH RETRIEVED CONTEXT ----
+retrieved = [DOCS[i] for i in idxs]
+context = "\n\n---\n\n".join(retrieved)
+
+prompt = f"""You are an expert assistant. Use ONLY the context to answer the question concisely.
+
+Context:
+{context}
+
+Question:
+{QUERY}
+
+Answer:"""
+
+print("\n=== PROMPT SENT TO LLM ===")
+print(prompt)
+
+# ---- 5) CALL OLLAMA (LLM) ----
+def call_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
+    try:
+        result = subprocess.run(
+            ["ollama", "run", model],
+            input=prompt,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            return f"[OLLAMA ERROR] {result.stderr.strip()}"
+        return result.stdout.strip()
+    except FileNotFoundError:
+        return "[OLLAMA ERROR] 'ollama' command not found. Is Ollama installed and on PATH?"
+
+answer = call_ollama(prompt)
+
+print("\n=== LLM RAW ANSWER ===")
+print(answer)
+
+# ---- 6) OPTIONAL: SHOW A JSON SUMMARY OF EVERYTHING PRINTED ABOVE ----
+summary = {
+    "device": device,
+    "model": "all-MiniLM-L6-v2",
+    "ollama_model": OLLAMA_MODEL,
+    "documents": DOCS,
+    "doc_embeddings_shape": list(doc_embeddings.shape),
+    "query": QUERY,
+    "top_k": k,
+    "search_results": [
+        {"doc_index": int(i), "score": float(s), "text": DOCS[int(i)]}
+        for i, s in zip(idxs, scores)
+    ],
+    "prompt": prompt,
+    "answer": answer
+}
+print("\n=== JSON SUMMARY ===")
+print(json.dumps(summary, indent=2, ensure_ascii=False))
